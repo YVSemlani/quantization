@@ -1,45 +1,29 @@
-from transformers import MambaConfig, MambaForCausalLM, AutoTokenizer
 import torch
+from mamba_ssm import Mamba2
 
-tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-130m-hf")
-model = MambaForCausalLM.from_pretrained("state-spaces/mamba-130m-hf")
-#input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"]
+batch, length, dim = 2, 64, 256
+x = torch.randn(batch, length, dim).to("cuda")
 
-#out = model.generate(input_ids, max_new_tokens=10)
-#print(tokenizer.batch_decode(out))
+class MambaModel(torch.nn.Module):
+    def __init__(self, num_layers):
+        super().__init__()
+        self.layers = torch.nn.ModuleList()
 
-print(model)
+        for _ in range(num_layers):
+            self.layers.append(Mamba2(
+                d_model=dim,
+                d_state=16,
+                d_conv=4,
+                expand=2,
+            ).to("cuda"))
 
-size_check = False
-if size_check:
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
-    # Number of parameters
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Number of parameters: {num_params:,}")
+model = MambaModel(4)
+y = model(x)
+assert y.shape == x.shape
 
-    # Model size in MB
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-    size_all_mb = (param_size + buffer_size) / 1024**2
-    print(f"Model size: {size_all_mb:.2f} MB")
-
-    # Perform quantization
-    quantized_model = MambaForCausalLM.from_pretrained(
-        "state-spaces/mamba-130m-hf",
-        load_in_4bit=True,
-        device_map="auto"  # or "cuda" if you want to force GPU
-    )
-
-    # Quantized model size in MB
-    param_size = 0
-    for param in quantized_model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in quantized_model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-    size_all_mb = (param_size + buffer_size) / 1024**2
-    print(f"Quantized model size: {size_all_mb:.2f} MB")
+print(model.layers)

@@ -168,7 +168,7 @@ tokenizer.chat_template = AutoTokenizer.from_pretrained("HuggingFaceH4/zephyr-7b
 print(type(model.backbone.layers[0]))
 #print(Block)
 
-# calibrate the model and get activation scales
+# STEP 1: calibrate the model and get activation scales
 
 def calibrate_model(model, tokenizer, num_samples=512, seq_len=512, calibration_dataset=None, preprocess_fn=None):
     layers = model.backbone.layers
@@ -176,6 +176,7 @@ def calibrate_model(model, tokenizer, num_samples=512, seq_len=512, calibration_
     get_mamba = lambda block: block.mixer
     is_calib_ops = lambda op: isinstance(op, torch.nn.Linear)
     is_x = lambda op: op == "x_proj"
+    is_ssm_state = lambda op: op == "dt_proj"
     percentile_alpha=0.9995 # for smaller model like 130m, use 0.99999
     
     # register min/max observers, num_layer + lm_head
@@ -200,12 +201,15 @@ def calibrate_model(model, tokenizer, num_samples=512, seq_len=512, calibration_
         
         # get the mamba mixer
         mixer = get_mamba(layer)
+        print(f"Layer {idx}: Found mixer {type(mixer)}")
         for name, m in mixer.named_modules():
+            print(f"  Module: {name} -> {type(m)}")
             if is_calib_ops(m):
+                print(f"    Registering hook for {name}")
                 a_bits = 8
                 a_clip_ratio = 1.0
                 op = name.split(".")[0]
-                if is_x(op):
+                if is_x(op) or is_ssm_state(op):
                     observers[idx][op + ":input"] = PerTensorPercentileObserver(
                         n_bits=a_bits,
                         clip_ratio=a_clip_ratio,
@@ -241,10 +245,24 @@ def calibrate_model(model, tokenizer, num_samples=512, seq_len=512, calibration_
     device = next(model.parameters()).device
     if calibration_dataset is None:
         print("Calibrate with monology/pile-uncopyrighted")
-        calibration_dataset = load_dataset("monology/pile-uncopyrighted", data_files="val.jsonl.zst", split="train")
+        # Try loading without specifying the compressed file
+        try:
+            calibration_dataset = load_dataset("monology/pile-uncopyrighted", split="train", streaming=True)
+            # Convert streaming dataset to regular dataset for indexing
+            calibration_dataset = calibration_dataset.take(num_samples * 2)  # Take more samples than needed
+            calibration_dataset = list(calibration_dataset)
+        except Exception as e:
+            print(f"Failed to load pile dataset: {e}")
+            print("Using a simple text dataset instead")
+            # Fallback to a simple dataset
+            calibration_dataset = [{"text": "This is a sample text for calibration. " * 50} for _ in range(num_samples)]
 
         def preprocess(data, tokenizer, max_tokens, device):
-            input_ids = tokenizer(data["text"], return_tensors="pt",
+            if isinstance(data, dict) and "text" in data:
+                text = data["text"]
+            else:
+                text = str(data)
+            input_ids = tokenizer(text, return_tensors="pt",
                     max_length=max_tokens, truncation=True).input_ids.to(device)
             return input_ids
         preprocess_fn = partial(preprocess, tokenizer=tokenizer, max_tokens=seq_len, device=device)
@@ -264,135 +282,73 @@ def calibrate_model(model, tokenizer, num_samples=512, seq_len=512, calibration_
     act_scales = [{} for _ in range(len(layers) + 1)]
     for i in range(len(layers) + 1):
         for name, observer in observers[i].items():
-            scale, base = observer.get_quantization_parameters()
-            # FIXME (HY): hardcode to not use base now
-            act_scales[i][name] = scale.to(torch.float32)
+            if observer.has_statistic:
+                scale, base = observer.get_quantization_parameters()
+                # FIXME (HY): hardcode to not use base now
+                act_scales[i][name] = scale.to(torch.float32)
+            else:
+                pass
+                #print(f"Warning: Observer {name} in layer {i} has no statistics, skipping...")
     del observers
     return act_scales
 
-calibrate_model(model, tokenizer, num_samples=512, seq_len=512, calibration_dataset=None, preprocess_fn=None)
+act_scales = calibrate_model(model, tokenizer, num_samples=512, seq_len=512, calibration_dataset=None, preprocess_fn=None)
+print(act_scales)
 
-"""
-@torch.no_grad()
-def run_quamba_calibration(
-        model, model_type, tokenizer, num_samples=512, seq_len=512,
-        calibration_dataset=None, preprocess_fn=None
-    ):
+# STEP 2: Write quantization functions
 
-    if model_type == "mamba":
-        layers = model.backbone.layers
-        is_traget_block = lambda block: isinstance(block, Block)
-        get_mamba = lambda block: block.mixer
-        is_calib_ops = lambda op: isinstance(op, torch.nn.Linear)
-        is_x = lambda op: op == "x_proj"
-        is_ssm_state = lambda op: op == "ssm_state_act"
-        percentile_alpha=0.9995 # for smaller model like 130m, use 0.99999
-    elif model_type == "mamba2":
-        layers = model.backbone.layers
-        is_traget_block = lambda block: isinstance(block, Block)
-        get_mamba = lambda block: block.mixer
-        is_calib_ops = lambda op: isinstance(op, torch.nn.Linear)
-        is_x = lambda op: op == "x_conv_out"
-        is_ssm_state = lambda op: op == "ssm_state_act"
-        percentile_alpha=0.9995  # for smaller model like 130m, use 0.99999
-    else:
-        raise ValueError(f"Unsupported model type: {model_type}, only support 'mamba' and 'mamba2'")
+def quantize_tensor(tensor, scale, bits=8):
+    q_max = 2**(bits-1) - 1
+    q_min = -2**(bits-1)
+    quantized = torch.round(tensor / scale).clamp(q_min, q_max).to(torch.int8)
+    return quantized
 
-    # register min/max observers, num_layer + lm_head
-    observers = [{} for _ in range(len(layers) + 1)]
-    
-    def stat_hook(m, inputs, outputs, op, block_idx):
-        # register the new information to observer
-        if isinstance(inputs, tuple):
-            inputs = inputs[0]
-        observers[block_idx][op + ":input"].update(inputs.clone().detach())
+def dequantize_tensor(tensor, scale):
+    if isinstance(scale, torch.Tensor):
+        scale = scale.to(tensor.device)
+    return tensor.float() * scale
 
-        if isinstance(outputs, tuple):
-            outputs = outputs[0]
-        observers[block_idx][op + ":output"].update(outputs.clone().detach())
+# STEP 3: Implement custom linear layer with integer operations
 
-    hooks = []
-    for i in range(len(layers)):
-        if not is_traget_block(layers[i]):
-            continue
-        
-        mixer = get_mamba(layers[i])
-        for name, m in mixer.named_modules():
-            if is_calib_ops(m):
-                # FIXME(HY): hardcode everything for now
-                a_bits = 8
-                a_clip_ratio = 1.0
-                op = name.split(".")[0]
-                if is_x(op) or is_ssm_state(op):
-                    observers[i][op + ":input"] = PerTensorPercentileObserver(
-                        n_bits=a_bits,
-                        clip_ratio=a_clip_ratio,
-                        sym=True,
-                        percentile_alpha=percentile_alpha
-                    )
-                else:
-                    observers[i][op + ":input"] = PerTensorMinmaxObserver(
-                        n_bits=a_bits,
-                        clip_ratio=a_clip_ratio,
-                        sym=True
-                    )
-                observers[i][op + ":output"] = PerTensorMinmaxObserver(
-                    n_bits=a_bits,
-                    clip_ratio=a_clip_ratio,
-                    sym=True
-                )
-                hooks.append(
-                    m.register_forward_hook(partial(stat_hook, op=op, block_idx=i))
-                )
-    # add observer hook for lm_head
-    observers[-1]["lm_head:input"] = PerTensorMinmaxObserver(
-        n_bits=a_bits, clip_ratio=a_clip_ratio, sym=True)
-    observers[-1]["lm_head:output"] = PerTensorMinmaxObserver(
-        n_bits=a_bits, clip_ratio=a_clip_ratio, sym=True)
-    hooks.append(
-        model.lm_head.register_forward_hook(partial(stat_hook, op="lm_head", block_idx=-1))
-    )
+class QuantizedLinear(torch.nn.Module):
+    def __init__(self, original_linear, w_scale, w_bits=8):
+        super().__init__()
 
-    device = next(model.parameters()).device
-    if calibration_dataset is None:
-        logger.info("Calibrate with monology/pile-uncopyrighted")
-        calibration_dataset = load_dataset("monology/pile-uncopyrighted", data_files="val.jsonl.zst", split="train")
-
-        def preprocess(data, tokenizer, max_tokens, device):
-            input_ids = tokenizer(data["text"], return_tensors="pt",
-                    max_length=max_tokens, truncation=True).input_ids.to(device)
-            return input_ids
-        preprocess_fn = partial(preprocess, tokenizer=tokenizer, max_tokens=seq_len, device=device)
-
-    logger.info("Run calibration")
-    for i in tqdm(range(num_samples)):
-        input_ids = preprocess_fn(calibration_dataset[i])
-        # prepare inference cache for getting ssm_state scales
-        prompt_len = input_ids.size(1)
-        inf_cache = model.allocate_inference_cache(1, prompt_len)
-        lengths_per_sample = torch.full((1,), prompt_len, dtype=torch.int32, device=device)
-        inference_params = InferenceParams(
-            max_seqlen=prompt_len,
-            max_batch_size=1,
-            seqlen_offset=0,
-            key_value_memory_dict=inf_cache,
-            lengths_per_sample=lengths_per_sample,
+        original_linear.weight.data = quantize_tensor(
+            original_linear.weight, w_scale, w_bits
         )
-        # do not set num_last_tokens because we want all activations to lm_head
-        model(input_ids, inference_params=inference_params)
-        # clean up the cache
-        del inf_cache
-    
-    for h in hooks:
-        h.remove()
-    
-    # collect in/output scaling factors for layers, num_layer + lm_head
-    act_scales = [{} for _ in range(len(layers) + 1)]
-    for i in range(len(layers) + 1):
-        for name, observer in observers[i].items():
-            scale, base = observer.get_quantization_parameters()
-            # FIXME (HY): hardcode to not use base now
-            act_scales[i][name] = scale.to(torch.float32)
-    del observers
-    return act_scales
-"""
+        
+        # Store quantized weights as integers
+        self.weight_quantized, self.weight_scale = quantize_tensor(
+            original_linear.weight, w_scale, w_bits
+        )
+        self.bias = original_linear.bias
+        
+    def forward(self, x):
+        # Dequantize weights for computation
+        weight_float = dequantize_tensor(self.weight_quantized, self.weight_scale)
+
+        # TO-DO: Implement int8 multiplication and addition
+
+        return torch.nn.functional.linear(x, weight_float, self.bias)
+
+# STEP 4.1: Implement static quantization
+
+def apply_static_quantization(model, act_scales, w_bits=8, a_bits=8):
+    """
+    Apply static quantization using pre-computed activation scales.
+    """
+    layers = model.backbone.layers
+    for layer_idx, layer in enumerate(layers):
+        if hasattr(layer, 'mixer'):
+            for module in layer.mixer.modules():
+                if isinstance(module, torch.nn.Linear):
+                    if module.in_proj == "x_proj":
+                        layers[layer_idx].mixer.in_proj = QuantizedLinear(module.weight, act_scales[layer_idx]["x_proj:input"], w_bits=w_bits)
+                    elif module.in_proj == "dt_proj":
+                        layers[layer_idx].mixer.dt_proj = QuantizedLinear(module.weight, act_scales[layer_idx]["dt_proj:input"], w_bits=w_bits)
+                    else:
+                        raise ValueError(f"Unknown in_proj type: {module.in_proj}")
+                    
+                    layers[layer_idx].mixer.out_proj = QuantizedLinear(module.weight, act_scales[layer_idx]["out_proj:output"], w_bits=w_bits)
+    return model
