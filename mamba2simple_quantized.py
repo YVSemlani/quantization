@@ -1,5 +1,3 @@
-# Copyright (c) 2024, Tri Dao, Albert Gu.
-
 import math
 import torch
 import torch.nn as nn
@@ -20,15 +18,41 @@ except ImportError:
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
-class QuantizedLinear(nn.Module):
-    def __init__(self, original_linear, w_scale, w_bits=8):
+from ops.gemm_int8 import int8_matmul
+
+def tensor_scale(tensor):
+    # returns tensor scale factor
+    return
+
+def quantize_tensor(tensor, scale, bits):
+    # takes tensor, scale factor, and bits
+    # returns a quantized tensor
+
+    return
+
+def dequantize_tensor(tensor, scale, bits):
+    # takes quantized tensor, scale factor, and bits
+    # returns a dequantized tensor
+    return
+
+class QuantizedLinear(nn.Linear):
+    def __init__(self, linear_layer, bits=8):
         super().__init__()
-        self.original_linear = original_linear
-        self.w_scale = w_scale
-        self.w_bits = w_bits
+        self.linear_layer = linear_layer
+        self.w_scale = weight_scale(self.linear_layer.weight)
+        self.b_scale = weight_scale(self.linear_layer.bias)
+        self.bits = bits
+
+        self.W = quantize_tensor(self.linear_layer.weight, self.w_scale, self.bits)
+        self.b = quantize_tensor(self.linear_layer.bias, self.b_scale, self.bits)
         
     def forward(self, x):
-        return quantize_tensor(self.original_linear(x), self.w_scale, self.w_bits)
+        xA_T = int8_matmul(x, self.W.T)
+        xA_T_scale = weight_scale(xA_T)
+        xA_T = quantize_tensor(xA_T, xA_T_scale, self.bits)
+
+        return xA_T + self.b
+
 
 
 class Mamba2SimpleQuantized(nn.Module):
